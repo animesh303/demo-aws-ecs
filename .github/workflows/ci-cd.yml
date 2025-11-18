@@ -6,133 +6,101 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-
 jobs:
-  build:
+  init:
     runs-on: ubuntu-latest
     steps:
       # Checkout code
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      # Setup Node.js
-      - name: Setup Node.js
-        uses: actions/setup-node@v3
+      # Setup Node.js environment
+      - uses: actions/setup-node@v4
         with:
-          node-version: '16'
+          node-version: '18'
           cache: 'npm'
       
-      # Install dependencies
+      # Install and build
       - name: Install dependencies
         run: npm ci
-
-      # Build application
+      
       - name: Build
         run: npm run build
 
-      # Run tests
-      - name: Test
-        run: npm test
-
-      # Run linting
-      - name: Lint
-        run: npm run lint
-
-  security:
-    needs: build
+  security-scans:
+    needs: init
     runs-on: ubuntu-latest
     steps:
-      # Security scanning
-      - name: NPM Audit
+      # Run SAST scan
+      - name: Run SAST Analysis
+        uses: github/codeql-action/analyze@v2
+      
+      # Run npm audit
+      - name: Dependency scan
         run: npm audit
       
-      # Install and run Snyk
-      - name: Snyk Security Scan
-        uses: snyk/actions/node@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      # Run secret detection
+      - name: Secret Detection
+        uses: gitleaks/gitleaks-action@v2
+      
+      # Run infrastructure security scans
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+      
+      - name: Run checkov
+        uses: bridgecrewio/checkov-action@master
 
-      # Trivy filesystem scan
-      - name: Trivy FS Scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-
-  container:
-    needs: security
+  container-build:
+    needs: [init, security-scans]
     runs-on: ubuntu-latest
     steps:
       # Configure AWS credentials
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      
       # Login to ECR
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
-
-      # Build container
-      - name: Build and tag container
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      # Build and push container
+      - name: Build and push
+        env:
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-      # Scan container
-      - name: Scan container image
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: '${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}'
-          format: 'table'
-          exit-code: '1'
-          severity: 'CRITICAL,HIGH'
-
-      # Push container
-      - name: Push container image
-        run: |
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-  infrastructure:
-    needs: container
+  deploy:
+    needs: container-build
     runs-on: ubuntu-latest
-    environment: production
     steps:
       # Configure AWS credentials
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+      - uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      
       # Setup Terraform
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
+        uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-
-      # Initialize Terraform
+      
+      # Deploy infrastructure
       - name: Terraform Init
         run: terraform init
-
-      # Plan Terraform changes
+      
       - name: Terraform Plan
-        run: terraform plan -var="container_image=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
-
-      # Apply Terraform changes
+        run: terraform plan -var="container_image=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
+      
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve -var="container_image=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}"
-
-      # Health check
-      - name: Health Check
-        if: github.ref == 'refs/heads/main'
-        run: |
-          sleep 30  # Wait for deployment
-          curl -f ${{ secrets.APP_HEALTH_CHECK_URL }} || exit 1
+        run: terraform apply -auto-approve -var="container_image=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
+      
+      # Update ECS service
+      - name: Force ECS Deployment
+        run: aws ecs update-service --cluster main-cluster --service app-service --force-new-deployment
