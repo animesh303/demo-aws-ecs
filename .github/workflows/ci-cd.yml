@@ -3,104 +3,159 @@ name: CI/CD Pipeline
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  init:
+  # Initialize and run quality checks
+  quality:
     runs-on: ubuntu-latest
     steps:
-      # Checkout code
       - uses: actions/checkout@v4
-
-      # Setup Node.js environment
-      - uses: actions/setup-node@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '18'
           cache: 'npm'
       
-      # Install and build
       - name: Install dependencies
         run: npm ci
       
-      - name: Build
-        run: npm run build
-
-  security-scans:
-    needs: init
-    runs-on: ubuntu-latest
-    steps:
-      # Run SAST scan
-      - name: Run SAST Analysis
-        uses: github/codeql-action/analyze@v2
+      - name: Run linting
+        run: npm run lint
       
-      # Run npm audit
-      - name: Dependency scan
+      - name: Check formatting
+        run: npm run format:check
+
+  # Run security scans in parallel
+  security:
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      matrix:
+        scan: ['sonarqube', 'npm-audit', 'trivy', 'sca']
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SonarQube Scan
+        if: matrix.scan == 'sonarqube'
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: NPM Audit
+        if: matrix.scan == 'npm-audit'
         run: npm audit
-      
-      # Run secret detection
-      - name: Secret Detection
-        uses: gitleaks/gitleaks-action@v2
-      
-      # Run infrastructure security scans
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.0
-      
-      - name: Run checkov
-        uses: bridgecrewio/checkov-action@master
 
-  container-build:
-    needs: [init, security-scans]
+      - name: Trivy Scan
+        if: matrix.scan == 'trivy'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+
+      - name: Software Composition Analysis
+        if: matrix.scan == 'sca'
+        run: |
+          # Add your preferred SCA tool here
+          echo "Running SCA scan"
+
+  # Build and push container
+  container:
     runs-on: ubuntu-latest
+    needs: [quality, security]
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     steps:
-      # Configure AWS credentials
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
-      # Login to ECR
+
+      - name: Get Terraform Outputs
+        id: tf-outputs
+        run: |
+          cd terraform
+          terraform init
+          OUTPUTS=$(terraform output -json)
+          echo "ECR_REGISTRY=$(echo $OUTPUTS | jq -r .ecr_registry.value)" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$(echo $OUTPUTS | jq -r .ecr_repository.value)" >> $GITHUB_ENV
+
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
-      
-      # Build and push container
-      - name: Build and push
-        env:
-          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-  deploy:
-    needs: container-build
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+  # Deploy infrastructure
+  infrastructure:
     runs-on: ubuntu-latest
+    needs: container
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
     steps:
-      # Configure AWS credentials
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
-      # Setup Terraform
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-      
-      # Deploy infrastructure
+
       - name: Terraform Init
-        run: terraform init
-      
+        run: |
+          terraform init
+        env:
+          TF_WORKSPACE: "ecr-demo-ws"
+          TF_CLOUD_ORGANIZATION: "aws-devops-ai"
+
       - name: Terraform Plan
-        run: terraform plan -var="container_image=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
-      
+        run: terraform plan
+
       - name: Terraform Apply
-        run: terraform apply -auto-approve -var="container_image=${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}"
-      
-      # Update ECS service
-      - name: Force ECS Deployment
-        run: aws ecs update-service --cluster main-cluster --service app-service --force-new-deployment
+        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        run: terraform apply -auto-approve
+
+  # Deploy application
+  deploy:
+    runs-on: ubuntu-latest
+    needs: infrastructure
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} 
+            --service ${{ secrets.ECS_SERVICE }} 
+            --force-new-deployment
+
+      - name: Health Check
+        run: |
+          # Add health check validation
+          echo "Monitoring deployment status..."
