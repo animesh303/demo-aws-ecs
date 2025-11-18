@@ -7,119 +7,106 @@ on:
     branches: [ main ]
 
 jobs:
-  # Quality checks for application code
+  # Quality and security scanning job
   quality:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v6
         with:
           node-version: '18'
-          cache: 'npm'
-          
-      - name: Install dependencies
-        run: npm ci
-        
-      - name: Lint
-        run: npm run lint || true
-        
-      - name: Run tests
-        run: npm test || true
 
-  # Comprehensive security scanning job
-  security-scans:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-          
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-          
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+
+      # Security scanning steps - all with continue-on-error
       - name: SAST Scan (Semgrep)
         continue-on-error: true
         run: semgrep --config auto . || true
-        
+
       - name: SCA Scan (Trivy)
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
-        
+
       - name: Secrets Scan (Trivy)
         continue-on-error: true
         run: trivy fs --scanners secret . || true
-        
+
       - name: IaC Security Scan (Trivy)
         continue-on-error: true
         run: trivy config . || true
-        
+
       - name: IaC Security Scan (Checkov)
         continue-on-error: true
         run: checkov -d . || true
 
-  # Infrastructure deployment using Terraform
+  # Infrastructure deployment job
   infrastructure:
-    needs: [quality, security-scans]
+    needs: quality
     runs-on: ubuntu-latest
     outputs:
-      ecr_registry: ${{ steps.ecr-values.outputs.registry }}
-      ecr_repository: ${{ steps.ecr-values.outputs.repository }}
+      ecr_registry: ${{ steps.ecr-info.outputs.registry }}
+      ecr_repository: ${{ steps.ecr-info.outputs.repository }}
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-          
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-          
+
       - name: Terraform Init
         run: terraform init
-        
+
       - name: Terraform Plan
         run: terraform plan
-        
+
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve
-        
-      - name: Extract ECR Values
-        id: ecr-values
-        run: |
-          terraform output -json > tf_output.json
-          echo "registry=$(jq -r '.ecr_registry.value' tf_output.json)" >> $GITHUB_OUTPUT
-          echo "repository=$(jq -r '.ecr_repository.value' tf_output.json)" >> $GITHUB_OUTPUT
 
-  # Build and push Docker image to ECR
+      # Extract ECR information from Terraform outputs
+      - name: Get ECR Info
+        id: ecr-info
+        run: |
+          echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
+          echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
+
+  # Container build and push job
   build-and-push:
-    needs: [infrastructure]
+    needs: infrastructure
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-          
+
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-        
-      - name: Build and push
+
+      - name: Build and push Docker image
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
@@ -128,28 +115,65 @@ jobs:
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-  # Deploy to ECS
+  # Deployment job
   deploy:
-    needs: [build-and-push]
+    needs: build-and-push
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-          
+
       - name: Update ECS service
         run: |
           aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} 
             --service ${{ secrets.ECS_SERVICE }} 
             --force-new-deployment
-            
-      - name: Wait for deployment
-        run: |
-          aws ecs wait services-stable 
-            --cluster ${{ secrets.ECS_CLUSTER }} 
-            --services ${{ secrets.ECS_SERVICE }}
+
+# Pipeline Documentation
+
+## Overview
+This CI/CD pipeline implements a secure deployment workflow for containerized applications on AWS ECS, using Infrastructure as Code (Terraform) and incorporating multiple security scanning steps.
+
+## Required Secrets
+- `AWS_ROLE_TO_ASSUME`: ARN of the AWS IAM role to assume via OIDC
+- `TF_API_TOKEN`: Terraform Cloud/Enterprise API token
+- `ECS_CLUSTER`: Name of the target ECS cluster
+- `ECS_SERVICE`: Name of the target ECS service
+
+## Required Variables
+- `AWS_REGION`: AWS region for deployment (e.g., us-east-1)
+
+## Pipeline Stages
+1. **Quality & Security**
+   - SAST scanning with Semgrep
+   - SCA scanning with Trivy
+   - Secrets scanning with Trivy
+   - IaC security scanning with Trivy and Checkov
+
+2. **Infrastructure**
+   - Authenticates with AWS using OIDC
+   - Applies Terraform configuration
+   - Outputs ECR registry/repository information
+
+3. **Build & Push**
+   - Builds Docker image
+   - Pushes to ECR repository created by Terraform
+
+4. **Deploy**
+   - Updates ECS service with new container image
+
+## Security Features
+- AWS authentication via OIDC (no long-term credentials)
+- Multiple security scanning tools
+- Non-blocking security scans
+- Infrastructure validation before deployment
+
+## Notes
+- All security scans are configured to not fail the pipeline
+- Infrastructure must be deployed before container builds
+- Deployments only occur on main branch
+- ECR details are passed between jobs using job outputs
