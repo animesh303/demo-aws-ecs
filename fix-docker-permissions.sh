@@ -1,0 +1,101 @@
+#!/bin/bash
+
+echo "🔧 Docker Setup Helper for WSL2"
+echo ""
+
+# Check if Docker is installed
+if ! command -v docker &> /dev/null; then
+    echo "❌ Docker is not installed"
+    echo ""
+    echo "For WSL2, you have two options:"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Option 1: Docker Desktop for Windows (Easiest - Recommended)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "1. Download and install Docker Desktop for Windows:"
+    echo "   https://www.docker.com/products/docker-desktop/"
+    echo ""
+    echo "2. After installation, open Docker Desktop"
+    echo ""
+    echo "3. Go to Settings → Resources → WSL Integration"
+    echo "   - Enable integration with your WSL2 distro"
+    echo "   - Apply & Restart"
+    echo ""
+    echo "4. Verify in WSL2:"
+    echo "   docker --version"
+    echo "   docker ps"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Option 2: Install Docker Engine in WSL2"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "Run these commands:"
+    echo ""
+    echo "  # Update packages"
+    echo "  sudo apt-get update"
+    echo ""
+    echo "  # Install prerequisites"
+    echo "  sudo apt-get install -y ca-certificates curl gnupg lsb-release"
+    echo ""
+    echo "  # Add Docker's official GPG key"
+    echo "  sudo mkdir -p /etc/apt/keyrings"
+    echo "  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
+    echo ""
+    echo "  # Set up repository"
+    echo "  echo \"deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
+    echo ""
+    echo "  # Install Docker Engine"
+    echo "  sudo apt-get update"
+    echo "  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+    echo ""
+    echo "  # Start Docker service"
+    echo "  sudo service docker start"
+    echo ""
+    echo "  # Add user to docker group"
+    echo "  sudo usermod -aG docker \$USER"
+    echo "  newgrp docker"
+    echo ""
+    echo "  # Verify"
+    echo "  docker ps"
+    echo ""
+    exit 1
+fi
+
+# Check if docker group exists
+if ! getent group docker &> /dev/null; then
+    echo "❌ Docker group does not exist"
+    echo ""
+    echo "This usually means Docker Engine is not properly installed."
+    echo ""
+    echo "If you're using Docker Desktop:"
+    echo "  1. Make sure Docker Desktop is running on Windows"
+    echo "  2. Check WSL2 integration is enabled in Docker Desktop settings"
+    echo "  3. Restart your WSL2 terminal"
+    echo ""
+    echo "If you want to install Docker Engine in WSL2, see Option 2 above."
+    echo "Or install Docker Desktop (Option 1) - it's easier!"
+    exit 1
+fi
+
+# Check if user is already in docker group
+if groups | grep -q "\bdocker\b"; then
+    echo "✅ User is already in the docker group"
+    echo ""
+    echo "If you still have permission issues, try:"
+    echo "  - Running: newgrp docker"
+    echo "  - Logging out and back in to your WSL2 session"
+    echo "  - Restarting Docker Desktop (if using Docker Desktop)"
+    exit 0
+fi
+
+echo "The current user ($USER) is not in the docker group."
+echo ""
+echo "To fix Docker permissions, run:"
+echo ""
+echo "  sudo usermod -aG docker $USER"
+echo "  newgrp docker  # or log out and back in"
+echo ""
+echo "Then verify:"
+echo "  docker ps"
+echo ""
+echo "After completing these steps, run ./deploy.sh again"
+

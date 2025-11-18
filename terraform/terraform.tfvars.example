@@ -1,0 +1,9 @@
+aws_region     = "us-east-1"
+app_name       = "demo-web-app"
+environment    = "demo"
+container_port = 3000
+container_cpu  = 256
+container_memory = 512
+desired_count  = 1
+ecr_image      = "" # Leave empty to use the ECR repository created by Terraform
+
