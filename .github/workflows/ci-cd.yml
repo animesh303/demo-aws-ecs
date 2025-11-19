@@ -67,7 +67,7 @@ jobs:
           python-version: '3.x'
       - name: Install Semgrep
         run: pip install semgrep
-      - name: Run Semgrep
+      - name: Run SAST scan
         continue-on-error: true
         run: semgrep --config auto . || true
 
@@ -78,7 +78,7 @@ jobs:
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-      - name: Run Trivy filesystem scan
+      - name: Run SCA scan
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
 
@@ -89,7 +89,7 @@ jobs:
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-      - name: Run Trivy secrets scan
+      - name: Run secrets scan
         continue-on-error: true
         run: trivy fs --scanners secret . || true
 
@@ -106,16 +106,19 @@ jobs:
           python-version: '3.x'
       - name: Install Checkov
         run: pip install checkov
-      - name: Run Trivy config scan
+      - name: Run Trivy IaC scan
         continue-on-error: true
         run: trivy config . || true
-      - name: Run Checkov
+      - name: Run Checkov scan
         continue-on-error: true
         run: checkov -d . || true
 
   infrastructure:
     needs: [lint, test, sast, sca, secrets, iac-security]
     runs-on: ubuntu-latest
+    outputs:
+      ecr_registry: ${{ steps.ecr-info.outputs.registry }}
+      ecr_repository: ${{ steps.ecr-info.outputs.repository }}
     steps:
       - uses: actions/checkout@v5
       - name: Configure AWS credentials
@@ -137,6 +140,23 @@ jobs:
         if: github.ref == 'refs/heads/main'
         working-directory: terraform
         run: terraform apply -auto-approve
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      - name: Get ECR repository from Terraform
+        if: github.ref == 'refs/heads/main'
+        id: ecr-info
+        working-directory: terraform
+        run: |
+          terraform output -json > tf_outputs.json
+          REPO_URL=$(jq -r '.ecr_repository_url.value // .ecr_repository.value // .ecr_repository_name.value // empty' tf_outputs.json)
+          if [[ "$REPO_URL" == *"amazonaws.com"* ]]; then
+            ECR_REPO=$(echo "$REPO_URL" | sed 's|.*/||')
+          else
+            ECR_REPO="$REPO_URL"
+          fi
+          echo "registry=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_OUTPUT
+          echo "repository=$ECR_REPO" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: [infrastructure]
@@ -149,15 +169,15 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      - name: Build and push
+      - name: Build and push image
+        working-directory: app
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f app/Dockerfile .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
@@ -173,6 +193,6 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Update ECS service
         run: |
-          aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} 
-            --service ${{ secrets.ECS_SERVICE }} 
+          aws ecs update-service --cluster demo-cluster 
+            --service demo-web-app 
             --force-new-deployment
