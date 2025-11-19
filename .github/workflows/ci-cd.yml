@@ -55,7 +55,7 @@ jobs:
       - name: Run tests
         if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: npm test || echo "No test script found"
+        run: npm test || echo "No tests found"
 
   sast:
     runs-on: ubuntu-latest
@@ -67,7 +67,7 @@ jobs:
           python-version: '3.x'
       - name: Install Semgrep
         run: pip install semgrep
-      - name: Run SAST scan
+      - name: Run Semgrep
         continue-on-error: true
         run: semgrep --config auto . || true
 
@@ -78,7 +78,7 @@ jobs:
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-      - name: Run SCA scan
+      - name: Run Trivy filesystem scan
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
 
@@ -89,7 +89,7 @@ jobs:
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-      - name: Run secrets scan
+      - name: Run Trivy secrets scan
         continue-on-error: true
         run: trivy fs --scanners secret . || true
 
@@ -106,10 +106,10 @@ jobs:
           python-version: '3.x'
       - name: Install Checkov
         run: pip install checkov
-      - name: Run Trivy IaC scan
+      - name: Run Trivy config scan
         continue-on-error: true
         run: trivy config . || true
-      - name: Run Checkov scan
+      - name: Run Checkov
         continue-on-error: true
         run: checkov -d . || true
 
@@ -144,7 +144,6 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
       - name: Get ECR repository from Terraform
-        if: github.ref == 'refs/heads/main'
         id: ecr-info
         working-directory: terraform
         run: |
@@ -170,7 +169,7 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
-      - name: Build and push image
+      - name: Build and push
         working-directory: app
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
@@ -182,8 +181,8 @@ jobs:
 
   deploy:
     needs: [build-and-push]
-    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Configure AWS credentials
@@ -192,7 +191,4 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Update ECS service
-        run: |
-          aws ecs update-service --cluster demo-cluster 
-            --service demo-web-app 
-            --force-new-deployment
+        run: aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} --service ${{ secrets.ECS_SERVICE }} --force-new-deployment
