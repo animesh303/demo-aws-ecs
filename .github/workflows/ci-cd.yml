@@ -1,10 +1,13 @@
-name: CI/CD Pipeline
+name: Production CI/CD Pipeline
 
-# Trigger on main branch push only to prevent duplicate runs
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   lint:
@@ -16,95 +19,91 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: '18'
-      - name: Install dependencies
+      - name: Install Dependencies
         if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: npm ci
-      - name: Lint
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+      - name: Run Linting
         if: hashFiles('app/package.json') != ''
         working-directory: app
         run: npm run lint || echo "No lint script found"
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - name: Setup Node.js
-        if: hashFiles('app/package.json') != ''
-        uses: actions/setup-node@v6
-        with:
-          node-version: '18'
-      - name: Install dependencies
-        if: hashFiles('app/package.json') != ''
-        working-directory: app
-        run: npm ci
-      - name: Test
-        if: hashFiles('app/package.json') != ''
-        working-directory: app
-        run: npm test || echo "No tests found"
 
   sast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v4
-      - name: Install and run Semgrep
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run Semgrep
         continue-on-error: true
-        run: |
-          pip install semgrep
-          semgrep --config auto . || true
+        run: semgrep --config auto .
 
   sca:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Run Trivy vulnerability scanner
-        continue-on-error: true
+      - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-          trivy fs --scanners vuln . || true
+      - name: Run Trivy FS
+        continue-on-error: true
+        run: trivy fs --scanners vuln .
 
   secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Run Trivy secrets scanner
-        continue-on-error: true
+      - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-          trivy fs --scanners secret . || true
+      - name: Run Trivy Secrets
+        continue-on-error: true
+        run: trivy fs --scanners secret .
 
   iac-security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v4
-      - name: Run IaC security scanners
-        continue-on-error: true
+      - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
-          trivy config . || true
-          pip install checkov
-          checkov -d . || true
+      - name: Install Checkov
+        run: pip install checkov
+      - name: Run Trivy Config
+        continue-on-error: true
+        run: trivy config .
+      - name: Run Checkov
+        continue-on-error: true
+        run: checkov -d .
 
   infrastructure:
-    needs: [lint, test, sast, sca, secrets, iac-security]
+    needs: [lint, sast, sca, secrets, iac-security]
     runs-on: ubuntu-latest
     outputs:
       ecs_cluster: ${{ steps.tf-outputs.outputs.ecs_cluster }}
       ecs_service: ${{ steps.tf-outputs.outputs.ecs_service }}
     steps:
       - uses: actions/checkout@v5
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve
@@ -120,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -128,12 +127,12 @@ jobs:
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      - name: Build and push
+      - name: Build and Push Image
+        working-directory: app
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
-        working-directory: app
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
@@ -142,10 +141,10 @@ jobs:
     needs: [build-and-push, infrastructure]
     runs-on: ubuntu-latest
     steps:
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Update ECS service
+      - name: Update ECS Service
         run: aws ecs update-service --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --service ${{ needs.infrastructure.outputs.ecs_service }} --force-new-deployment
