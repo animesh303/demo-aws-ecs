@@ -1,14 +1,10 @@
 name: CI/CD Pipeline
 
+# Trigger on main branch push only to prevent duplicate runs
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-permissions:
-  id-token: write
-  contents: read
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -23,13 +19,8 @@ jobs:
       - name: Install dependencies
         if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-      - name: Run linting
+        run: npm ci
+      - name: Lint
         if: hashFiles('app/package.json') != ''
         working-directory: app
         run: npm run lint || echo "No lint script found"
@@ -46,13 +37,8 @@ jobs:
       - name: Install dependencies
         if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
-      - name: Run tests
+        run: npm ci
+      - name: Test
         if: hashFiles('app/package.json') != ''
         working-directory: app
         run: npm test || echo "No tests found"
@@ -61,66 +47,52 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-      - name: Install Semgrep
-        run: pip install semgrep
-      - name: Run Semgrep
+      - uses: actions/setup-python@v4
+      - name: Install and run Semgrep
         continue-on-error: true
-        run: semgrep --config auto . || true
+        run: |
+          pip install semgrep
+          semgrep --config auto . || true
 
   sca:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
-      - name: Run Trivy filesystem scan
+      - name: Run Trivy vulnerability scanner
         continue-on-error: true
-        run: trivy fs --scanners vuln . || true
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --scanners vuln . || true
 
   secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
-      - name: Run Trivy secrets scan
+      - name: Run Trivy secrets scanner
         continue-on-error: true
-        run: trivy fs --scanners secret . || true
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy fs --scanners secret . || true
 
   iac-security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Trivy
+      - uses: actions/setup-python@v4
+      - name: Run IaC security scanners
+        continue-on-error: true
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-      - name: Install Checkov
-        run: pip install checkov
-      - name: Run Trivy config scan
-        continue-on-error: true
-        run: trivy config . || true
-      - name: Run Checkov
-        continue-on-error: true
-        run: checkov -d . || true
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy config . || true
+          pip install checkov
+          checkov -d . || true
 
   infrastructure:
     needs: [lint, test, sast, sca, secrets, iac-security]
     runs-on: ubuntu-latest
     outputs:
-      ecr_registry: ${{ steps.ecr-info.outputs.registry }}
-      ecr_repository: ${{ steps.ecr-info.outputs.repository }}
-      ecs_cluster: ${{ steps.ecr-info.outputs.ecs_cluster }}
-      ecs_service: ${{ steps.ecr-info.outputs.ecs_service }}
+      ecs_cluster: ${{ steps.tf-outputs.outputs.ecs_cluster }}
+      ecs_service: ${{ steps.tf-outputs.outputs.ecs_service }}
     steps:
       - uses: actions/checkout@v5
       - name: Configure AWS credentials
@@ -130,41 +102,18 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-        with:
-          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
-      - name: Terraform Plan
-        working-directory: terraform
-        run: terraform plan
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-      - name: Get ECR and ECS outputs from Terraform
-        id: ecr-info
+      - name: Get Terraform Outputs
+        id: tf-outputs
         working-directory: terraform
         run: |
-          terraform output -json > tf_outputs.json
-          REPO_URL=$(jq -r '.ecr_repository_url.value // .ecr_repository.value // .ecr_repository_name.value // empty' tf_outputs.json)
-          if [[ "$REPO_URL" == *"amazonaws.com"* ]]; then
-            ECR_REPO=$(echo "$REPO_URL" | sed 's|.*/||')
-          else
-            ECR_REPO="$REPO_URL"
-          fi
-          ECS_CLUSTER=$(jq -r '.ecs_cluster_name.value // .ecs_cluster.value // empty' tf_outputs.json)
-          ECS_SERVICE=$(jq -r '.ecs_service_name.value // .ecs_service.value // empty' tf_outputs.json)
-          echo "registry=${{ steps.login-ecr.outputs.registry }}" >> $GITHUB_OUTPUT
-          echo "repository=$ECR_REPO" >> $GITHUB_OUTPUT
-          if [ -n "$ECS_CLUSTER" ]; then
-            echo "ecs_cluster=$ECS_CLUSTER" >> $GITHUB_OUTPUT
-          fi
-          if [ -n "$ECS_SERVICE" ]; then
-            echo "ecs_service=$ECS_SERVICE" >> $GITHUB_OUTPUT
-          fi
+          echo "ecs_cluster=$(terraform output -raw ecs_cluster_name)" >> $GITHUB_OUTPUT
+          echo "ecs_service=$(terraform output -raw ecs_service_name)" >> $GITHUB_OUTPUT
 
   build-and-push:
     needs: [infrastructure]
@@ -177,11 +126,26 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
       - name: Build and push
-        working-directory: app
         env:
-          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
-        run:
+        working-directory: app
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+  deploy:
+    needs: [build-and-push, infrastructure]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Update ECS service
+        run: aws ecs update-service --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --service ${{ needs.infrastructure.outputs.ecs_service }} --force-new-deployment
