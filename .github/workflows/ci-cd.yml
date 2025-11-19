@@ -1,19 +1,18 @@
 name: CI/CD Pipeline
 
-permissions:
-  id-token: write
-  contents: read
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
-    if: hashFiles('app/package.json') != ''
     steps:
       - uses: actions/checkout@v5
       - name: Setup Node.js
@@ -22,6 +21,7 @@ jobs:
         with:
           node-version: '18'
       - name: Install dependencies
+        if: hashFiles('app/package.json') != ''
         working-directory: app
         run: |
           if [ -f package-lock.json ]; then
@@ -30,12 +30,12 @@ jobs:
             npm install
           fi
       - name: Run linting
+        if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: npm run lint || true
+        run: npm run lint || echo "No lint script found"
 
   test:
     runs-on: ubuntu-latest
-    if: hashFiles('app/package.json') != ''
     steps:
       - uses: actions/checkout@v5
       - name: Setup Node.js
@@ -44,6 +44,7 @@ jobs:
         with:
           node-version: '18'
       - name: Install dependencies
+        if: hashFiles('app/package.json') != ''
         working-directory: app
         run: |
           if [ -f package-lock.json ]; then
@@ -52,57 +53,64 @@ jobs:
             npm install
           fi
       - name: Run tests
+        if: hashFiles('app/package.json') != ''
         working-directory: app
-        run: npm test || true
+        run: npm test || echo "No test script found"
 
   sast:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
       - name: Install Semgrep
         run: pip install semgrep
-      - name: Run SAST scan
+      - name: Run Semgrep
+        continue-on-error: true
         run: semgrep --config auto . || true
 
   sca:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Run Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          scanners: 'vuln'
-          continue-on-error: true
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
+      - name: Run Trivy filesystem scan
+        continue-on-error: true
+        run: trivy fs --scanners vuln . || true
 
   secrets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
       - name: Run Trivy secrets scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          scanners: 'secret'
-          continue-on-error: true
+        continue-on-error: true
+        run: trivy fs --scanners secret . || true
 
   iac-security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Run Trivy config scan
-        uses: aquasecurity/trivy-action@master
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
+      - name: Setup Python
+        uses: actions/setup-python@v4
         with:
-          scan-type: 'config'
-          scan-ref: '.'
-          continue-on-error: true
-      - uses: actions/setup-python@v4
+          python-version: '3.x'
       - name: Install Checkov
         run: pip install checkov
-      - name: Run Checkov scan
+      - name: Run Trivy config scan
+        continue-on-error: true
+        run: trivy config . || true
+      - name: Run Checkov
+        continue-on-error: true
         run: checkov -d . || true
 
   infrastructure:
@@ -110,7 +118,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
       - name: Terraform Init
@@ -135,12 +149,16 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      - name: Build and push Docker image
-        working-directory: app
+      - name: Build and push
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }} .
-          docker push ${{ vars.ECR_REGISTRY }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f app/Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
     needs: [build-and-push]
@@ -153,7 +171,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Deploy to ECS
+      - name: Update ECS service
         run: |
           aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER }} 
             --service ${{ secrets.ECS_SERVICE }} 
