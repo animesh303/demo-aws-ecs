@@ -1,78 +1,79 @@
 name: CI/CD Pipeline
 
+# Trigger only on main branch pushes (covers PR merges)
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
+
+env:
+  ECS_CLUSTER: production
+  ECS_SERVICE: demo-service
+  CONTAINER_NAME: demo-app
 
 jobs:
+  # Security and quality checks
   quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       
-      # Setup Node.js environment
+      # Setup Node.js without cache to avoid lock file dependency
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
-          # Skip cache since we can't guarantee lock file exists
       
-      - name: Install Dependencies
-        working-directory: app
+      - name: Install dependencies
         run: npm install
-
-      - name: Lint
-        working-directory: app
-        run: npm run lint || true
-
+      
       # Install security scanning tools
-      - name: Install Security Tools
+      - name: Install security tools
         run: |
           pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
 
       # Run security scans with continue-on-error
-      - name: SAST Scan (Semgrep)
+      - name: SAST Scan
+        continue-on-error: true
         run: semgrep --config auto .
-        continue-on-error: true
 
-      - name: SCA Scan (Trivy)
+      - name: SCA Scan
+        continue-on-error: true
         run: trivy fs --scanners vuln .
-        continue-on-error: true
 
-      - name: Secrets Scan (Trivy)
-        run: trivy fs --scanners secret .
+      - name: Secrets Scan
         continue-on-error: true
+        run: trivy fs --scanners secret .
 
       - name: IaC Security Scan (Trivy)
-        run: trivy config .
         continue-on-error: true
+        run: trivy config .
 
       - name: IaC Security Scan (Checkov)
-        run: checkov -d .
         continue-on-error: true
+        run: checkov -d .
 
+  # Infrastructure deployment using Terraform
   infrastructure:
     needs: quality
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     outputs:
-      ecr_registry: ${{ steps.ecr-details.outputs.registry }}
-      ecr_repository: ${{ steps.ecr-details.outputs.repository }}
-      ecs_cluster: ${{ steps.ecs-details.outputs.cluster }}
-      ecs_service: ${{ steps.ecs-details.outputs.service }}
+      ecr_registry: ${{ steps.tf-outputs.outputs.registry }}
+      ecr_repository: ${{ steps.tf-outputs.outputs.repository }}
+      ecs_cluster: ${{ steps.tf-outputs.outputs.cluster }}
+      ecs_service: ${{ steps.tf-outputs.outputs.service }}
     steps:
       - uses: actions/checkout@v3
 
-      # Configure AWS credentials using OIDC
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Setup and initialize Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -85,33 +86,27 @@ jobs:
         run: terraform plan
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve
 
-      # Extract infrastructure details
-      - name: Get Infrastructure Details
-        id: ecr-details
-        if: github.ref == 'refs/heads/main'
+      - name: Extract Terraform Outputs
+        id: tf-outputs
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
           echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
-
-      - name: Get ECS Details
-        id: ecs-details
-        if: github.ref == 'refs/heads/main'
-        run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  build:
+  # Build and push container image
+  build-and-push:
     needs: infrastructure
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v3
 
-      # Configure AWS credentials using OIDC
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -121,37 +116,33 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      # Build and push container image
-      - name: Build and Push Image
-        env:
-          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ needs.infrastructure.outputs.ecr_repository }}:${{ github.sha }}
+            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ needs.infrastructure.outputs.ecr_repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
+  # Deploy to ECS
   deploy:
-    needs: [build, infrastructure]
-    if: github.ref == 'refs/heads/main'
+    needs: [infrastructure, build-and-push]
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      # Configure AWS credentials using OIDC
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Deploy to ECS
-      - name: Update ECS Service
-        env:
-          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
-          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --force-new-deployment
+      - name: Update ECS service
+        run: aws ecs update-service --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --service ${{ needs.infrastructure.outputs.ecs_service }} --force-new-deployment
 
-      - name: Wait for ECS Deployment
-        env:
-          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
-          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs wait services-stable --cluster ${ECS_CLUSTER} --services ${ECS_SERVICE}
+      - name: Wait for service stability
+        run: aws ecs wait services-stable --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --services ${{ needs.infrastructure.outputs.ecs_service }}
