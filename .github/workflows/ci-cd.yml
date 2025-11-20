@@ -12,60 +12,56 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      # Setup Node.js environment
+      # Setup Node.js without cache since lock file existence is unknown
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: 'app/package.json'
-
+          
+      # Use npm install instead of ci for compatibility
       - name: Install dependencies
-        working-directory: app
-        run: npm ci
-
+        run: npm install
+        
       - name: Lint
-        working-directory: app
         run: npm run lint || true
-
+        
       - name: Run tests
-        working-directory: app
         run: npm test || true
 
   security-scans:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-
+      
       # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
 
       # Run SAST scan
-      - name: SAST - Semgrep
-        continue-on-error: true
+      - name: SAST Scan (Semgrep)
         run: semgrep --config auto .
-
-      # Run dependency vulnerability scan
-      - name: SCA - Trivy FS
         continue-on-error: true
+        
+      # Run SCA scan
+      - name: SCA Scan (Trivy)
         run: trivy fs --scanners vuln .
-
-      # Check for exposed secrets
-      - name: Secrets Scan - Trivy
         continue-on-error: true
+        
+      # Check for secrets
+      - name: Secrets Scan (Trivy)
         run: trivy fs --scanners secret .
-
+        continue-on-error: true
+        
       # Scan Infrastructure as Code
-      - name: IaC Scan - Trivy Config
-        continue-on-error: true
+      - name: IaC Security Scan (Trivy)
         run: trivy config .
-
-      - name: IaC Scan - Checkov
         continue-on-error: true
+        
+      - name: IaC Security Scan (Checkov)
         run: checkov -d .
+        continue-on-error: true
 
   infrastructure:
     needs: [quality, security-scans]
@@ -77,30 +73,30 @@ jobs:
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
-
+      
       # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+          
       # Setup Terraform CLI
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-
+          
       - name: Terraform Init
         run: terraform init
-
+        
       - name: Terraform Plan
         run: terraform plan
-
+        
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main'
         run: terraform apply -auto-approve
-
+        
       # Extract infrastructure details
       - name: Get Infrastructure Details
         id: ecr-details
@@ -119,26 +115,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-
+      
       # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+          
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-
-      # Build and push Docker image
+        
+      # Build and push container image
       - name: Build and push
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
@@ -147,17 +143,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-
+      
       # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+          
       # Deploy to ECS
       - name: Update ECS service
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+            
+      - name: Wait for service stability
+        env:
+          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
+          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
+        run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
