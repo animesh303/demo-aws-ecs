@@ -1,19 +1,17 @@
-# CI/CD Pipeline with security scanning, infrastructure deployment, and ECS deployment
 name: CI/CD Pipeline
 
-# Trigger only on main branch pushes (covers PR merges)
 on:
-  push:
-    branches: [ main ]
+  pull_request:
+    branches: [main]
 
 env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
   ECR_REPOSITORY: ecr-demo
-  ECS_CLUSTER: main-cluster
+  ECS_CLUSTER: production
   ECS_SERVICE: demo-service
   CONTAINER_NAME: demo-app
 
 jobs:
-  # Quality and security scanning stage
   quality:
     runs-on: ubuntu-latest
     permissions:
@@ -21,46 +19,42 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
+      # Setup Node.js without cache since lock file existence is unknown
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: '18'
-          # Note: cache enabled assuming package-lock.json exists
-          cache: 'npm'
           
       - name: Install dependencies
-        run: npm ci
+        run: npm install
         
-      - name: Lint
-        run: npm run lint || true
-        
+      # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
-          
-      # Security scanning steps - all non-blocking
-      - name: SAST Scan (Semgrep)
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+
+      # Run security scans with continue-on-error
+      - name: SAST Scan
         run: semgrep --config auto .
         continue-on-error: true
-        
-      - name: SCA Scan (Trivy)
+
+      - name: SCA Scan
         run: trivy fs --scanners vuln .
         continue-on-error: true
-        
-      - name: Secrets Scan (Trivy)
+
+      - name: Secrets Scan
         run: trivy fs --scanners secret .
         continue-on-error: true
-        
+
       - name: IaC Security Scan (Trivy)
         run: trivy config .
         continue-on-error: true
-        
+
       - name: IaC Security Scan (Checkov)
         run: checkov -d .
         continue-on-error: true
 
-  # Infrastructure deployment stage
   infrastructure:
     needs: quality
     runs-on: ubuntu-latest
@@ -72,17 +66,19 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
+      # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
           
+      # Setup and run Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-          
+
       - name: Terraform Init
         run: terraform init
         
@@ -92,13 +88,12 @@ jobs:
       - name: Terraform Apply
         run: terraform apply -auto-approve
         
+      # Get ECR details from Terraform outputs
       - name: Get ECR Details
         id: ecr-details
         run: |
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          echo "registry=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> $GITHUB_OUTPUT
+          echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
 
-  # Container build and push stage
   build:
     needs: infrastructure
     runs-on: ubuntu-latest
@@ -108,25 +103,29 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
+      # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
           
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-        
-      - name: Build and push image
-        env:
-          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-  # ECS deployment stage
+      # Build and push Docker image
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -134,14 +133,30 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # Configure AWS credentials using OIDC
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ vars.AWS_REGION }}
-          
-      - name: Update ECS service
-        run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
-            
-      - name: Wait for deployment
-        run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Download and update ECS task definition
+      - name: Download task definition
+        run: aws ecs describe-task-definition --task-definition ${{ env.ECS_SERVICE }} --query taskDefinition > task-definition.json
+
+      - name: Fill in new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ needs.infrastructure.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # Deploy to ECS
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
