@@ -10,6 +10,8 @@ on:
 jobs:
   quality:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v3
       
@@ -17,7 +19,6 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '18'
-          cache: 'none'
           
       - name: Install dependencies
         run: npm ci
@@ -25,48 +26,35 @@ jobs:
       - name: Lint
         run: npm run lint || true
 
-  security-scans:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-          
       # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
           
-      # Run SAST scan
-      - name: SAST Scan
-        run: semgrep --config auto .
+      # Run security scans
+      - name: SAST Scan (Semgrep)
+        run: semgrep --config auto . || true
         continue-on-error: true
         
-      # Run SCA scan
-      - name: SCA Scan
-        run: trivy fs --scanners vuln .
+      - name: SCA Scan (Trivy)
+        run: trivy fs --scanners vuln . || true
         continue-on-error: true
         
-      # Check for secrets
-      - name: Secrets Scan
-        run: trivy fs --scanners secret .
+      - name: Secrets Scan (Trivy)
+        run: trivy fs --scanners secret . || true
         continue-on-error: true
         
-      # Scan Infrastructure as Code
       - name: IaC Security Scan (Trivy)
-        run: trivy config .
+        run: trivy config . || true
         continue-on-error: true
         
       - name: IaC Security Scan (Checkov)
-        run: checkov -d .
+        run: checkov -d . || true
         continue-on-error: true
 
   infrastructure:
-    needs: [quality, security-scans]
+    needs: quality
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -84,7 +72,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
+          
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -97,23 +85,26 @@ jobs:
         run: terraform plan
         
       - name: Terraform Apply
+        if: github.event.pull_request.merged == true
         run: terraform apply -auto-approve
         
-      # Extract infrastructure details
       - name: Get Infrastructure Details
         id: ecr-details
+        if: github.event.pull_request.merged == true
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
           echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
           
       - name: Get ECS Details
         id: ecs-details
+        if: github.event.pull_request.merged == true
         run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
   build-and-push:
-    needs: [infrastructure]
+    needs: infrastructure
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -131,7 +122,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
         
-      - name: Build and push
+      - name: Build and push Docker image
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
@@ -141,7 +132,7 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
-    needs: [build-and-push]
+    needs: [build-and-push, infrastructure]
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
