@@ -1,4 +1,3 @@
-# CI/CD Pipeline with Security Scans and AWS OIDC Authentication
 name: CI/CD Pipeline
 
 on:
@@ -8,19 +7,9 @@ on:
     types:
       - closed
 
-env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ecr-demo
-  ECS_CLUSTER: production
-  ECS_SERVICE: demo-service
-  CONTAINER_NAME: demo-app
-
 jobs:
-  # Security and quality checks
   quality:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v3
       
@@ -28,111 +17,131 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '18'
-          cache: 'npm'
+          cache: 'none'
           
       - name: Install dependencies
         run: npm ci
         
+      - name: Lint
+        run: npm run lint || true
+
+  security-scans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          
+      # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.0
-
-      - name: SAST Scan (Semgrep)
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+          
+      # Run SAST scan
+      - name: SAST Scan
         run: semgrep --config auto .
         continue-on-error: true
-
-      - name: SCA Scan (Trivy)
+        
+      # Run SCA scan
+      - name: SCA Scan
         run: trivy fs --scanners vuln .
         continue-on-error: true
-
-      - name: Secrets Scan (Trivy)
+        
+      # Check for secrets
+      - name: Secrets Scan
         run: trivy fs --scanners secret .
         continue-on-error: true
-
+        
+      # Scan Infrastructure as Code
       - name: IaC Security Scan (Trivy)
         run: trivy config .
         continue-on-error: true
-
+        
       - name: IaC Security Scan (Checkov)
         run: checkov -d .
         continue-on-error: true
 
-  # Infrastructure deployment using Terraform
   infrastructure:
-    needs: quality
+    needs: [quality, security-scans]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     outputs:
       ecr_registry: ${{ steps.ecr-details.outputs.registry }}
+      ecr_repository: ${{ steps.ecr-details.outputs.repository }}
       ecs_cluster: ${{ steps.ecs-details.outputs.cluster }}
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
-
+      
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+      
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-
+        
       - name: Terraform Init
         run: terraform init
-
+        
       - name: Terraform Plan
         run: terraform plan
-
+        
       - name: Terraform Apply
-        if: github.event.pull_request.merged == true
         run: terraform apply -auto-approve
-
+        
+      # Extract infrastructure details
       - name: Get Infrastructure Details
         id: ecr-details
-        if: github.event.pull_request.merged == true
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
+          echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
+          
+      - name: Get ECS Details
+        id: ecs-details
+        run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  # Build and push container image
   build-and-push:
-    needs: infrastructure
-    if: github.event.pull_request.merged == true
+    needs: [infrastructure]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v3
-
+      
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+          
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Build and push Docker image
+        
+      - name: Build and push
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-  # Deploy to ECS
   deploy:
-    needs: [infrastructure, build-and-push]
+    needs: [build-and-push]
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
@@ -144,9 +153,15 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-
+          
       - name: Update ECS service
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+        run: aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE }} --force-new-deployment
+            
+      - name: Wait for service stability
+        env:
+          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
+          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
+        run: aws ecs wait services-stable --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }}
