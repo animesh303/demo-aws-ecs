@@ -7,55 +7,63 @@ on:
     types:
       - closed
 
-env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ecr-demo
-  ECS_CLUSTER: main-cluster
-  ECS_SERVICE: demo-service
-  CONTAINER_NAME: demo-app
-
+# Security scanning jobs run in parallel
 jobs:
-  # Quality and security scanning job
-  quality:
+  sast:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      
-      # Install security scanning tools
-      - name: Install Security Tools
-        run: |
-          pip install semgrep checkov
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      
-      # SAST scanning with Semgrep
-      - name: SAST Scan (Semgrep)
+      - name: Install Semgrep
+        run: pip install semgrep
+      - name: Run SAST Scan
         continue-on-error: true
         run: semgrep --config auto . || true
-      
-      # Software composition analysis with Trivy
-      - name: SCA Scan (Trivy)
+
+  sca:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      - name: Run SCA Scan
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
-      
-      # Secrets scanning with Trivy
-      - name: Secrets Scan (Trivy)
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      - name: Run Secrets Scan
         continue-on-error: true
         run: trivy fs --scanners secret . || true
-      
-      # Infrastructure as Code scanning
-      - name: IaC Security Scan (Trivy)
-        continue-on-error: true
-        run: trivy config . || true
-      
-      - name: IaC Security Scan (Checkov)
-        continue-on-error: true
-        run: checkov -d . || true
 
-  # Infrastructure deployment job
+  iac-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Scanners
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+          pip install checkov
+      - name: Run IaC Scans
+        continue-on-error: true
+        run: |
+          trivy config . || true
+          checkov -d . || true
+
+  # Deploy infrastructure using Terraform
   infrastructure:
-    needs: quality
+    needs: [sast, sca, secrets-scan, iac-scan]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -67,99 +75,74 @@ jobs:
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
-      
-      # Configure AWS credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
-      # Setup and run Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-      
       - name: Terraform Init
         run: terraform init
-      
       - name: Terraform Plan
         run: terraform plan
-      
       - name: Terraform Apply
         if: github.event.pull_request.merged == true
         run: terraform apply -auto-approve
-      
-      # Extract infrastructure details
       - name: Get Infrastructure Details
         id: ecr-details
-        if: github.event.pull_request.merged == true
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
           echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
-      
       - name: Get ECS Details
         id: ecs-details
-        if: github.event.pull_request.merged == true
         run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  # Container build and push job
+  # Build and push container image
   build:
-    needs: infrastructure
-    if: github.event.pull_request.merged == true
+    needs: [infrastructure]
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v3
-      
-      # Configure AWS credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
-      # Login to ECR
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
-      
-      # Build and push container image
       - name: Build and Push Image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ needs.infrastructure.outputs.ecr_repository }}:${{ github.sha }}
-            ${{ needs.infrastructure.outputs.ecr_registry }}/${{ needs.infrastructure.outputs.ecr_repository }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-  # ECS deployment job
+  # Deploy to ECS
   deploy:
-    needs: [infrastructure, build]
+    needs: [build]
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
-      # Configure AWS credentials using OIDC
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
-      # Deploy to ECS
-      - name: Update ECS Service
-        run: aws ecs update-service --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --service ${{ needs.infrastructure.outputs.ecs_service }} --force-new-deployment
-      
-      # Wait for deployment to complete
-      - name: Wait for Deployment
-        run: aws ecs wait services-stable --cluster ${{ needs.infrastructure.outputs.ecs_cluster }} --services ${{ needs.infrastructure.outputs.ecs_service }}
+      - name: Deploy to ECS
+        env:
+          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
+          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
+        run: aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE }} --force-new-deployment
