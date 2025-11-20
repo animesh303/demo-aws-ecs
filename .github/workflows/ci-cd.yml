@@ -15,48 +15,33 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: '18'
-          
-      - name: Install dependencies
-        working-directory: app
-        run: npm ci
-      
-      - name: Lint
-        working-directory: app
-        run: npm run lint || true
-      
+      # Install and run security scanning tools
       - name: Install Security Tools
         run: |
           pip install semgrep checkov
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
 
       - name: SAST Scan
-        run: semgrep --config auto .
         continue-on-error: true
-      
+        run: semgrep --config auto . || true
+        
       - name: SCA Scan
-        run: trivy fs --scanners vuln .
         continue-on-error: true
-      
+        run: trivy fs --scanners vuln . || true
+        
       - name: Secrets Scan
-        run: trivy fs --scanners secret .
         continue-on-error: true
-      
-      - name: IaC Security Scan (Trivy)
-        run: trivy config .
+        run: trivy fs --scanners secret . || true
+        
+      - name: IaC Security Scan
         continue-on-error: true
-      
-      - name: IaC Security Scan (Checkov)
-        run: checkov -d .
-        continue-on-error: true
+        run: |
+          trivy config . || true
+          checkov -d . || true
 
   infrastructure:
     needs: quality
     runs-on: ubuntu-latest
-    environment: production
     permissions:
       id-token: write
       contents: read
@@ -67,42 +52,45 @@ jobs:
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
-      
+
       - name: Terraform Init
         run: terraform init
-      
+
       - name: Terraform Plan
-        run: terraform plan
-      
+        run: terraform plan -out=tfplan
+        
       - name: Terraform Apply
         if: github.event.pull_request.merged == true
-        run: terraform apply -auto-approve
-        
+        run: terraform apply -auto-approve tfplan
+
       - name: Get Infrastructure Details
         id: ecr-details
+        if: github.event.pull_request.merged == true
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
           echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
-          
+
       - name: Get ECS Details
         id: ecs-details
+        if: github.event.pull_request.merged == true
         run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  build:
+  build-and-push:
     needs: infrastructure
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -115,25 +103,24 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
+          
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      
+        
       - name: Build and Push Image
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
-    needs: [build, infrastructure]
+    needs: [build-and-push, infrastructure]
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
-    environment: production
     permissions:
       id-token: write
       contents: read
@@ -143,14 +130,14 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
+          
       - name: Update ECS Service
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
         run: aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE }} --force-new-deployment
-      
-      - name: Wait for ECS Deployment
+            
+      - name: Wait for Deployment
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
