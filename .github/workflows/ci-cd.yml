@@ -1,5 +1,6 @@
 name: CI/CD Pipeline
 
+# Trigger on PR close to main branch only
 on:
   pull_request:
     branches:
@@ -7,8 +8,13 @@ on:
     types:
       - closed
 
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TERRAFORM_WORKING_DIR: terraform
+
+# Security scanning jobs run in parallel
 jobs:
-  # Security Scanning Jobs - Run in Parallel
+  # Static Application Security Testing
   sast:
     runs-on: ubuntu-latest
     permissions:
@@ -21,6 +27,7 @@ jobs:
         continue-on-error: true
         run: semgrep --config auto . || true
 
+  # Software Composition Analysis
   sca:
     runs-on: ubuntu-latest
     permissions:
@@ -33,6 +40,7 @@ jobs:
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
 
+  # Secrets Scanning
   secrets-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -45,6 +53,7 @@ jobs:
         continue-on-error: true
         run: trivy fs --scanners secret . || true
 
+  # Infrastructure as Code Security Scanning
   iac-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -75,65 +84,110 @@ jobs:
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
+      
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
       - name: Terraform Init
-        working-directory: terraform
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
         run: terraform init
+
       - name: Terraform Plan
-        working-directory: terraform
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
         run: terraform plan
+
       - name: Terraform Apply
-        if: github.event.pull_request.merged == true
-        working-directory: terraform
+        id: terraform-apply
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
         run: terraform apply -auto-approve
-      - name: Get Infrastructure Details
-        if: github.event.pull_request.merged == true
+
+      - name: List Available Outputs
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
+        continue-on-error: true
+        run: terraform output
+
+      - name: Get ECR Details
         id: ecr-details
-        working-directory: terraform
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
         run: |
-          echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
-          echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
+          if [ "${{ steps.terraform-apply.outcome }}" != "success" ]; then
+            echo "Error: Terraform apply failed"
+            exit 1
+          fi
+          REGISTRY=$(terraform output -raw ecr_registry 2>&1)
+          REPOSITORY=$(terraform output -raw ecr_repository 2>&1)
+          if [[ "$REGISTRY" == *"Error"* ]] || [[ -z "$REGISTRY" ]]; then
+            REGISTRY="${{ vars.ECR_REGISTRY }}"
+          fi
+          if [[ "$REPOSITORY" == *"Error"* ]] || [[ -z "$REPOSITORY" ]]; then
+            REPOSITORY="${{ vars.ECR_REPOSITORY }}"
+          fi
+          echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
+          echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
+
       - name: Get ECS Details
-        if: github.event.pull_request.merged == true
         id: ecs-details
-        working-directory: terraform
+        working-directory: ${{ env.TERRAFORM_WORKING_DIR }}
         run: |
-          echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
-          echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
+          CLUSTER=$(terraform output -raw ecs_cluster 2>&1)
+          SERVICE=$(terraform output -raw ecs_service 2>&1)
+          if [[ "$CLUSTER" == *"Error"* ]] || [[ -z "$CLUSTER" ]]; then
+            CLUSTER="${{ vars.ECS_CLUSTER }}"
+          fi
+          if [[ "$SERVICE" == *"Error"* ]] || [[ -z "$SERVICE" ]]; then
+            SERVICE="${{ vars.ECS_SERVICE }}"
+          fi
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+          echo "service=$SERVICE" >> $GITHUB_OUTPUT
 
   # Build and Push Container
   build:
     needs: [infrastructure]
-    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v3
+      
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
+
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Validate ECR Values
+        run: |
+          ECR_REGISTRY="${{ needs.infrastructure.outputs.ecr_registry }}"
+          ECR_REPOSITORY="${{ needs.infrastructure.outputs.ecr_repository }}"
+          if [[ -z "$ECR_REGISTRY" ]] || [[ "$ECR_REGISTRY" == *"Error"* ]]; then
+            echo "Error: Invalid ECR_REGISTRY"
+            exit 1
+          fi
+          if [[ -z "$ECR_REPOSITORY" ]] || [[ "$ECR_REPOSITORY" == *"Error"* ]]; then
+            echo "Error: Invalid ECR_REPOSITORY"
+            exit 1
+          fi
+
       - name: Build and Push
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
+          cd app
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   # Deploy to ECS
@@ -149,9 +203,3 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ vars.AWS_REGION }}
-      - name: Update ECS Service
-        env:
-          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
-          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --force-new-deployment
