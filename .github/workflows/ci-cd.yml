@@ -7,8 +7,8 @@ on:
     types:
       - closed
 
-# Security scanning jobs run in parallel
 jobs:
+  # Security Scanning Jobs - Run in Parallel
   sast:
     runs-on: ubuntu-latest
     permissions:
@@ -61,7 +61,7 @@ jobs:
           trivy config . || true
           checkov -d . || true
 
-  # Deploy infrastructure using Terraform
+  # Infrastructure Deployment
   infrastructure:
     needs: [sast, sca, secrets-scan, iac-scan]
     runs-on: ubuntu-latest
@@ -85,26 +85,34 @@ jobs:
         with:
           cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
       - name: Terraform Init
+        working-directory: terraform
         run: terraform init
       - name: Terraform Plan
+        working-directory: terraform
         run: terraform plan
       - name: Terraform Apply
         if: github.event.pull_request.merged == true
+        working-directory: terraform
         run: terraform apply -auto-approve
       - name: Get Infrastructure Details
+        if: github.event.pull_request.merged == true
         id: ecr-details
+        working-directory: terraform
         run: |
           echo "registry=$(terraform output -raw ecr_registry)" >> $GITHUB_OUTPUT
           echo "repository=$(terraform output -raw ecr_repository)" >> $GITHUB_OUTPUT
       - name: Get ECS Details
+        if: github.event.pull_request.merged == true
         id: ecs-details
+        working-directory: terraform
         run: |
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  # Build and push container image
+  # Build and Push Container
   build:
     needs: [infrastructure]
+    if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -117,14 +125,15 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
       - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
-      - name: Build and Push Image
+      - name: Build and Push
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   # Deploy to ECS
@@ -141,8 +150,8 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      - name: Deploy to ECS
+      - name: Update ECS Service
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs update-service --cluster ${{ env.ECS_CLUSTER }} --service ${{ env.ECS_SERVICE }} --force-new-deployment
+        run: aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --force-new-deployment
