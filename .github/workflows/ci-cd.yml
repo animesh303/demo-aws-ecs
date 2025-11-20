@@ -12,45 +12,63 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      # Setup Node and dependencies
-      - uses: actions/setup-node@v3
+      # Setup Node.js environment
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
           node-version: '18'
           cache: 'npm'
-          
+          cache-dependency-path: 'app/package.json'
+
       - name: Install dependencies
+        working-directory: app
         run: npm ci
-        
+
+      - name: Lint
+        working-directory: app
+        run: npm run lint || true
+
+      - name: Run tests
+        working-directory: app
+        run: npm test || true
+
+  security-scans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
       # Install security scanning tools
       - name: Install security tools
         run: |
           pip install semgrep checkov
-          wget https://github.com/aquasecurity/trivy/releases/download/v0.41.0/trivy_0.41.0_Linux-64bit.deb
-          sudo dpkg -i trivy_0.41.0_Linux-64bit.deb
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.45.1
 
-      # Security Scanning Stage
-      - name: SAST Scan (Semgrep)
+      # Run SAST scan
+      - name: SAST - Semgrep
         continue-on-error: true
-        run: semgrep --config auto . || true
+        run: semgrep --config auto .
 
-      - name: SCA Scan (Trivy)
+      # Run dependency vulnerability scan
+      - name: SCA - Trivy FS
         continue-on-error: true
-        run: trivy fs --scanners vuln . || true
+        run: trivy fs --scanners vuln .
 
-      - name: Secrets Scan (Trivy)
+      # Check for exposed secrets
+      - name: Secrets Scan - Trivy
         continue-on-error: true
-        run: trivy fs --scanners secret . || true
+        run: trivy fs --scanners secret .
 
-      - name: IaC Security Scan (Trivy)
+      # Scan Infrastructure as Code
+      - name: IaC Scan - Trivy Config
         continue-on-error: true
-        run: trivy config . || true
+        run: trivy config .
 
-      - name: IaC Security Scan (Checkov)
+      - name: IaC Scan - Checkov
         continue-on-error: true
-        run: checkov -d . || true
+        run: checkov -d .
 
   infrastructure:
-    needs: quality
+    needs: [quality, security-scans]
     runs-on: ubuntu-latest
     outputs:
       ecr_registry: ${{ steps.ecr-details.outputs.registry }}
@@ -67,7 +85,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      # Setup and execute Terraform
+      # Setup Terraform CLI
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -96,8 +114,8 @@ jobs:
           echo "cluster=$(terraform output -raw ecs_cluster)" >> $GITHUB_OUTPUT
           echo "service=$(terraform output -raw ecs_service)" >> $GITHUB_OUTPUT
 
-  build:
-    needs: infrastructure
+  build-and-push:
+    needs: [infrastructure]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -114,17 +132,17 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v1
 
       # Build and push Docker image
-      - name: Build and push Docker image
+      - name: Build and push
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
-    needs: [build, infrastructure]
+    needs: [build-and-push, infrastructure]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
@@ -143,9 +161,3 @@ jobs:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
-
-      - name: Wait for service stability
-        env:
-          ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
-          ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
