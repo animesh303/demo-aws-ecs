@@ -20,9 +20,9 @@ jobs:
       ecs_cluster: ${{ steps.ecs-details.outputs.cluster }}
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS credentials
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -56,13 +56,12 @@ jobs:
           fi
           
           REPO_URL=$(terraform output -raw ecr_repository_url 2>&1)
-          if [[ "$REPO_URL" == *"Error"* ]] || [[ -z "$REPO_URL" ]]; then
-            echo "Using GitHub variables as fallback"
-            REGISTRY="${{ vars.ECR_REGISTRY }}"
-            REPOSITORY="${{ vars.ECR_REPOSITORY }}"
-          else
+          if [[ "$REPO_URL" == *".dkr.ecr."* ]]; then
             REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
             REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
+          else
+            REGISTRY="${{ vars.ECR_REGISTRY }}"
+            REPOSITORY="${{ vars.ECR_REPOSITORY }}"
           fi
           
           echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
@@ -72,15 +71,8 @@ jobs:
         id: ecs-details
         working-directory: terraform
         run: |
-          CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1)
-          SERVICE=$(terraform output -raw ecs_service_name 2>&1)
-          
-          if [[ "$CLUSTER" == *"Error"* ]] || [[ -z "$CLUSTER" ]]; then
-            CLUSTER="${{ vars.ECS_CLUSTER }}"
-          fi
-          if [[ "$SERVICE" == *"Error"* ]] || [[ -z "$SERVICE" ]]; then
-            SERVICE="${{ vars.ECS_SERVICE }}"
-          fi
+          CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1 || echo "${{ vars.ECS_CLUSTER }}")
+          SERVICE=$(terraform output -raw ecs_service_name 2>&1 || echo "${{ vars.ECS_SERVICE }}")
           
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
@@ -93,16 +85,17 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS credentials
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        uses: aws-actions/amazon-ecr-login@v1
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set ECR Values
         run: |
@@ -114,13 +107,12 @@ jobs:
           fi
           echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_ENV
           echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
-          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
 
-      - name: Build and push Docker image
+      - name: Build and Push Image
         working-directory: app
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
 
   deploy:
     needs: [infrastructure, build]
@@ -130,7 +122,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -151,5 +143,4 @@ jobs:
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
 
       - name: Wait for Service to Stabilize
-        continue-on-error: true
         run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
