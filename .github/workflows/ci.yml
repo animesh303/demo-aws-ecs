@@ -1,0 +1,72 @@
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+
+jobs:
+  sast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Semgrep
+        run: pip install semgrep
+      
+      - name: Run Semgrep SAST
+        continue-on-error: true
+        run: semgrep --config auto . || true
+
+  sca:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      
+      - name: Trivy SCA (Filesystem)
+        continue-on-error: true
+        run: trivy fs --scanners vuln . || true
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      
+      - name: Trivy Secrets Scan
+        continue-on-error: true
+        run: trivy fs --scanners secret . || true
+
+  iac-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      
+      - name: Install Checkov
+        run: pip install checkov
+      
+      - name: Trivy IaC Scan
+        continue-on-error: true
+        run: trivy config . || true
+      
+      - name: Run Checkov
+        continue-on-error: true
+        run: checkov -d . || true
