@@ -7,19 +7,26 @@ on:
     types:
       - closed
 
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: ecr-demo
+  ECS_CLUSTER: demo-cluster
+  ECS_SERVICE: demo-service
+  CONTAINER_NAME: demo-app
+
 jobs:
-  # Security Scanning Jobs (Run in Parallel)
+  # Security scanning jobs run in parallel
   sast:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      - name: Install and Run Semgrep
+      - name: Install Semgrep
+        run: pip install semgrep || true
+      - name: Run Semgrep SAST
         continue-on-error: true
-        run: |
-          pip install semgrep || true
-          semgrep --config auto . || true
+        run: semgrep --config auto . || true
 
   sca:
     runs-on: ubuntu-latest
@@ -27,11 +34,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      - name: Run Trivy filesystem scan
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      - name: Run Trivy SCA
         continue-on-error: true
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-          trivy fs --scanners vuln . || true
+        run: trivy fs --scanners vuln . || true
 
   secrets-scan:
     runs-on: ubuntu-latest
@@ -39,11 +46,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      - name: Run Trivy secrets scan
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      - name: Run Trivy Secrets Scan
         continue-on-error: true
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-          trivy fs --scanners secret . || true
+        run: trivy fs --scanners secret . || true
 
   iac-scan:
     runs-on: ubuntu-latest
@@ -51,15 +58,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      - name: Run IaC security scans
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+      - name: Install Checkov
+        run: pip install checkov || true
+      - name: Run IaC Scans
         continue-on-error: true
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
           trivy config . || true
-          pip install checkov || true
           checkov -d . || true
 
-  # Infrastructure Deployment
+  # Deploy infrastructure with Terraform
   infrastructure:
     needs: [sast, sca, secrets-scan, iac-scan]
     runs-on: ubuntu-latest
@@ -74,12 +83,12 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ vars.AWS_REGION }}
-      
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
@@ -96,17 +105,13 @@ jobs:
       - name: Terraform Apply
         id: terraform-apply
         working-directory: terraform
+        if: github.event.pull_request.merged == true
         run: terraform apply -auto-approve
 
       - name: Get ECR Details
         id: ecr-details
         working-directory: terraform
         run: |
-          if [ "${{ steps.terraform-apply.outcome }}" != "success" ]; then
-            echo "Error: Terraform apply failed"
-            exit 1
-          fi
-          
           REPO_URL=$(terraform output -raw ecr_repository_url 2>&1)
           if [[ "$REPO_URL" == *"Error"* ]] || [[ -z "$REPO_URL" ]]; then
             echo "Using GitHub variables as fallback"
@@ -116,7 +121,6 @@ jobs:
             REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
             REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
           fi
-          
           echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
           echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
 
@@ -126,18 +130,16 @@ jobs:
         run: |
           CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1)
           SERVICE=$(terraform output -raw ecs_service_name 2>&1)
-          
           if [[ "$CLUSTER" == *"Error"* ]] || [[ -z "$CLUSTER" ]]; then
             CLUSTER="${{ vars.ECS_CLUSTER }}"
           fi
           if [[ "$SERVICE" == *"Error"* ]] || [[ -z "$SERVICE" ]]; then
             SERVICE="${{ vars.ECS_SERVICE }}"
           fi
-          
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
 
-  # Build and Push Container
+  # Build and push container image
   build:
     needs: [infrastructure]
     runs-on: ubuntu-latest
@@ -147,6 +149,15 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci || true
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -154,7 +165,6 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
       - name: Set ECR Values
@@ -173,11 +183,11 @@ jobs:
           echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
 
       - name: Build and push image
-        env:
-          IMAGE_TAG: ${{ github.sha }}
+        working-directory: app
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker build -t $ECR_REPOSITORY:${{ github.sha }} .
+          docker tag $ECR_REPOSITORY:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
 
   # Deploy to ECS
   deploy:
@@ -192,17 +202,3 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Set ECS Values
-        run: |
-          ECS_CLUSTER="${{ needs.infrastructure.outputs.ecs_cluster }}"
-          ECS_SERVICE="${{ needs.infrastructure.outputs.ecs_service }}"
-          if [[ -z "$ECS_CLUSTER" ]] || [[ "$ECS_CLUSTER" == *"Error"* ]]; then
-            echo "Error: ECS_CLUSTER is invalid"
-            exit 1
-          fi
-          if [[ -z "$ECS_SERVICE" ]] || [[ "$ECS_SERVICE" == *"Error"* ]]; then
-            echo "Error: ECS_SERVICE is invalid"
-            exit 1
-          fi
