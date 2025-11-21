@@ -144,6 +144,11 @@ jobs:
             echo "Error: ECS_SERVICE is not set and no fallback available"
             exit 1
           fi
+
+          terraform output -raw ecs_cluster_name
+          terraform output -raw ecs_service_name
+          echo "Cluster identified - $CLUSTER"
+          echo "Service identified - $SERVICE"
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
 
