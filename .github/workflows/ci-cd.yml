@@ -73,7 +73,7 @@ jobs:
       ecs_service: ${{ steps.ecs-details.outputs.service }}
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -129,10 +129,20 @@ jobs:
           CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1)
           SERVICE=$(terraform output -raw ecs_service_name 2>&1)
           if [[ "$CLUSTER" == *"Error"* ]] || [[ -z "$CLUSTER" ]]; then
+            echo "Using GitHub variable as fallback for ECS_CLUSTER"
             CLUSTER="${{ vars.ECS_CLUSTER }}"
           fi
           if [[ "$SERVICE" == *"Error"* ]] || [[ -z "$SERVICE" ]]; then
+            echo "Using GitHub variable as fallback for ECS_SERVICE"
             SERVICE="${{ vars.ECS_SERVICE }}"
+          fi
+          if [[ -z "$CLUSTER" ]]; then
+            echo "Error: ECS_CLUSTER is not set and no fallback available"
+            exit 1
+          fi
+          if [[ -z "$SERVICE" ]]; then
+            echo "Error: ECS_SERVICE is not set and no fallback available"
+            exit 1
           fi
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
@@ -146,7 +156,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      
+
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -199,4 +209,13 @@ jobs:
         env:
           ECS_CLUSTER: ${{ needs.infrastructure.outputs.ecs_cluster }}
           ECS_SERVICE: ${{ needs.infrastructure.outputs.ecs_service }}
-        run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
+        run: |
+          if [[ -z "$ECS_CLUSTER" ]] || [[ "$ECS_CLUSTER" == *"Error"* ]]; then
+            echo "Error: ECS_CLUSTER is not set or invalid"
+            exit 1
+          fi
+          if [[ -z "$ECS_SERVICE" ]] || [[ "$ECS_SERVICE" == *"Error"* ]]; then
+            echo "Error: ECS_SERVICE is not set or invalid"
+            exit 1
+          fi
+          aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
