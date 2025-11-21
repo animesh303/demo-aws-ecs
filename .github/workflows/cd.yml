@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -56,12 +56,13 @@ jobs:
           fi
           
           REPO_URL=$(terraform output -raw ecr_repository_url 2>&1)
-          if [[ "$REPO_URL" == *".dkr.ecr."* ]]; then
-            REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
-            REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
-          else
+          if [[ "$REPO_URL" == *"Error"* ]] || [[ -z "$REPO_URL" ]]; then
+            echo "Using GitHub variables as fallback"
             REGISTRY="${{ vars.ECR_REGISTRY }}"
             REPOSITORY="${{ vars.ECR_REPOSITORY }}"
+          else
+            REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
+            REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
           fi
           
           echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
@@ -71,12 +72,14 @@ jobs:
         id: ecs-details
         working-directory: terraform
         run: |
-          CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1 || echo "${{ vars.ECS_CLUSTER }}")
-          SERVICE=$(terraform output -raw ecs_service_name 2>&1 || echo "${{ vars.ECS_SERVICE }}")
+          CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1)
+          SERVICE=$(terraform output -raw ecs_service_name 2>&1)
           
-          if [[ -z "$CLUSTER" ]] || [[ -z "$SERVICE" ]]; then
-            echo "Error: ECS values not found"
-            exit 1
+          if [[ "$CLUSTER" == *"Error"* ]] || [[ -z "$CLUSTER" ]]; then
+            CLUSTER="${{ vars.ECS_CLUSTER }}"
+          fi
+          if [[ "$SERVICE" == *"Error"* ]] || [[ -z "$SERVICE" ]]; then
+            SERVICE="${{ vars.ECS_SERVICE }}"
           fi
           
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
@@ -91,8 +94,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-
-      - name: Configure AWS Credentials
+      
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -101,13 +104,21 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build and Push Image
-        env:
-          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
-          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Set ECR Values
         run: |
-          cd app
+          ECR_REGISTRY="${{ needs.infrastructure.outputs.ecr_registry }}"
+          ECR_REPOSITORY="${{ needs.infrastructure.outputs.ecr_repository }}"
+          if [[ -z "$ECR_REGISTRY" ]] || [[ -z "$ECR_REPOSITORY" ]]; then
+            echo "Error: ECR values not set"
+            exit 1
+          fi
+          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_ENV
+          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        working-directory: app
+        run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -119,7 +130,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
@@ -136,9 +147,9 @@ jobs:
           echo "ECS_CLUSTER=$ECS_CLUSTER" >> $GITHUB_ENV
           echo "ECS_SERVICE=$ECS_SERVICE" >> $GITHUB_ENV
 
-      - name: Deploy to ECS
+      - name: Update ECS Service
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
 
-      - name: Wait for Service Stability
+      - name: Wait for Service to Stabilize
         continue-on-error: true
         run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
