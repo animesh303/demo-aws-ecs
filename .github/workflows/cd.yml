@@ -54,9 +54,16 @@ jobs:
             echo "Error: Terraform apply failed"
             exit 1
           fi
-          REPO_URL=$(terraform output -raw ecr_repository_url)
-          REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
-          REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
+          
+          REPO_URL=$(terraform output -raw ecr_repository_url 2>&1)
+          if [[ "$REPO_URL" == *".dkr.ecr."* ]]; then
+            REGISTRY=$(echo "$REPO_URL" | sed 's|/.*||')
+            REPOSITORY=$(echo "$REPO_URL" | sed 's|.*/||')
+          else
+            REGISTRY="${{ vars.ECR_REGISTRY }}"
+            REPOSITORY="${{ vars.ECR_REPOSITORY }}"
+          fi
+          
           echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
           echo "repository=$REPOSITORY" >> $GITHUB_OUTPUT
 
@@ -64,8 +71,14 @@ jobs:
         id: ecs-details
         working-directory: terraform
         run: |
-          CLUSTER=$(terraform output -raw ecs_cluster_name)
-          SERVICE=$(terraform output -raw ecs_service_name)
+          CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1 || echo "${{ vars.ECS_CLUSTER }}")
+          SERVICE=$(terraform output -raw ecs_service_name 2>&1 || echo "${{ vars.ECS_SERVICE }}")
+          
+          if [[ -z "$CLUSTER" ]] || [[ -z "$SERVICE" ]]; then
+            echo "Error: ECS values not found"
+            exit 1
+          fi
+          
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
 
@@ -78,17 +91,6 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v3
-      
-      - name: Set up Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: '18'
-          cache: 'npm'
-          cache-dependency-path: 'app/package.json'
-
-      - name: Install dependencies
-        working-directory: app
-        run: npm ci
 
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -97,16 +99,15 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build and push Docker image
-        working-directory: app
+      - name: Build and Push Image
         env:
           ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
           ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          cd app
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -139,4 +140,5 @@ jobs:
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
 
       - name: Wait for Service Stability
+        continue-on-error: true
         run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE

@@ -5,10 +5,11 @@ on:
     types:
       - opened
       - reopened
-    branches: 
+    branches:
       - main
 
 jobs:
+  # Static Application Security Testing (SAST)
   sast:
     runs-on: ubuntu-latest
     permissions:
@@ -17,10 +18,11 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install Semgrep
         run: pip install semgrep
-      - name: Run SAST Scan
-        run: semgrep --config auto . || true
+      - name: Run Semgrep SAST
         continue-on-error: true
+        run: semgrep --config auto . || true
 
+  # Software Composition Analysis (SCA)
   sca:
     runs-on: ubuntu-latest
     permissions:
@@ -29,10 +31,11 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install Trivy
         run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      - name: Run SCA Scan
-        run: trivy fs --scanners vuln . || true
+      - name: Trivy SCA (Filesystem)
         continue-on-error: true
+        run: trivy fs --scanners vuln . || true
 
+  # Secrets Scanning
   secrets-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -41,10 +44,11 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install Trivy
         run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      - name: Run Secrets Scan
-        run: trivy fs --scanners secret . || true
+      - name: Trivy Secrets Scan
         continue-on-error: true
+        run: trivy fs --scanners secret . || true
 
+  # Infrastructure as Code (IaC) Security Scanning
   iac-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -53,11 +57,11 @@ jobs:
       - uses: actions/checkout@v3
       - name: Install Trivy
         run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      - name: Run IaC Config Scan
-        run: trivy config . || true
-        continue-on-error: true
       - name: Install Checkov
         run: pip install checkov
-      - name: Run Checkov Scan
-        run: checkov -d . || true
+      - name: Trivy IaC Scan
         continue-on-error: true
+        run: trivy config . || true
+      - name: Run Checkov
+        continue-on-error: true
+        run: checkov -d . || true
