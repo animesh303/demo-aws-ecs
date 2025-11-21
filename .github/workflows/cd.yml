@@ -7,6 +7,10 @@ on:
     types:
       - closed
 
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: terraform
+
 jobs:
   infrastructure:
     if: github.event.pull_request.merged == true
@@ -74,6 +78,11 @@ jobs:
           CLUSTER=$(terraform output -raw ecs_cluster_name 2>&1 || echo "${{ vars.ECS_CLUSTER }}")
           SERVICE=$(terraform output -raw ecs_service_name 2>&1 || echo "${{ vars.ECS_SERVICE }}")
           
+          if [[ -z "$CLUSTER" ]] || [[ -z "$SERVICE" ]]; then
+            echo "Error: ECS values not found"
+            exit 1
+          fi
+          
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
           echo "service=$SERVICE" >> $GITHUB_OUTPUT
 
@@ -94,25 +103,21 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set ECR Values
-        run: |
-          ECR_REGISTRY="${{ needs.infrastructure.outputs.ecr_registry }}"
-          ECR_REPOSITORY="${{ needs.infrastructure.outputs.ecr_repository }}"
-          if [[ -z "$ECR_REGISTRY" ]] || [[ -z "$ECR_REPOSITORY" ]]; then
-            echo "Error: ECR values not set"
-            exit 1
-          fi
-          echo "ECR_REGISTRY=$ECR_REGISTRY" >> $GITHUB_ENV
-          echo "ECR_REPOSITORY=$ECR_REPOSITORY" >> $GITHUB_ENV
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
       - name: Build and Push Image
-        working-directory: app
+        env:
+          ECR_REGISTRY: ${{ needs.infrastructure.outputs.ecr_registry }}
+          ECR_REPOSITORY: ${{ needs.infrastructure.outputs.ecr_repository }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG app/
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
   deploy:
     needs: [infrastructure, build]
@@ -139,8 +144,8 @@ jobs:
           echo "ECS_CLUSTER=$ECS_CLUSTER" >> $GITHUB_ENV
           echo "ECS_SERVICE=$ECS_SERVICE" >> $GITHUB_ENV
 
-      - name: Update ECS Service
+      - name: Deploy to ECS
         run: aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --force-new-deployment
 
-      - name: Wait for Service to Stabilize
+      - name: Wait for Service Stability
         run: aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
