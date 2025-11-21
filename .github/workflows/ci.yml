@@ -30,7 +30,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Trivy
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
       - name: Run SCA Scan
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
@@ -43,12 +44,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Trivy
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
       - name: Run Secrets Scan
         continue-on-error: true
         run: trivy fs --scanners secret . || true
 
-  # Infrastructure as Code Security Scanning
+  # Infrastructure as Code (IaC) Security Scanning
   iac-scan:
     runs-on: ubuntu-latest
     permissions:
@@ -56,7 +58,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Trivy
-        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
       - name: Install Checkov
         run: pip install checkov
       - name: Run Trivy IaC Scan
