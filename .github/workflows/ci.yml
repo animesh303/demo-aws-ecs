@@ -8,6 +8,9 @@ on:
     branches: 
       - main
 
+permissions:
+  contents: read
+
 jobs:
   # Static Application Security Testing with Semgrep
   sast:
@@ -17,7 +20,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Install Semgrep
         run: pip install semgrep
       
@@ -33,11 +36,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      
+
       - name: Run SCA Scan
         continue-on-error: true
         run: trivy fs --scanners vuln . || true
@@ -50,11 +53,11 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      
+
       - name: Run Secrets Scan
         continue-on-error: true
         run: trivy fs --scanners secret . || true
@@ -67,18 +70,18 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
-      
+
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.47.0
-      
+
       - name: Install Checkov
         run: pip install checkov
-      
+
       - name: Run Trivy IaC Scan
         continue-on-error: true
         run: trivy config . || true
-      
+
       - name: Run Checkov Scan
         continue-on-error: true
         run: checkov -d . || true
